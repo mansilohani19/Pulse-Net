@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PulseNet - live traffic monitor</title>
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --line:#2a313c; --text:#e6edf3; --muted:#8b949e;
+    --ok:#3fb950; --alert:#f85149; --warn:#d29922; --accent:#58a6ff;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f8fa; --panel:#ffffff; --line:#d0d7de; --text:#1f2328; --muted:#656d76;
+            --ok:#1a7f37; --alert:#cf222e; --warn:#9a6700; --accent:#0969da; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:var(--mono); font-size:14px; }
+  header { display:flex; justify-content:space-between; align-items:center; padding:14px 24px; border-bottom:1px solid var(--line); }
+  h1 { font-size:16px; margin:0; font-weight:600; letter-spacing:.02em; }
+  #status { display:flex; align-items:center; gap:8px; color:var(--muted); }
+  #dot { width:10px; height:10px; border-radius:50%; background:var(--alert); }
+  #dot.on { background:var(--ok); }
+  main { max-width:1100px; margin:0 auto; padding:20px 24px 40px; display:grid; gap:16px; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
+  .card .v { font-size:26px; font-weight:600; margin-top:4px; }
+  .card .k { color:var(--muted); font-size:12px; }
+  .v.alert { color:var(--alert); }
+  canvas { width:100%; height:220px; display:block; }
+  h2 { font-size:13px; margin:0 0 10px; color:var(--muted); font-weight:500; }
+  #feed { max-height:340px; overflow-y:auto; }
+  .row { display:grid; grid-template-columns:96px 1fr 80px 120px; gap:10px; padding:7px 4px; border-top:1px solid var(--line); align-items:center; }
+  .row:first-child { border-top:0; }
+  .row .t { color:var(--muted); white-space:nowrap; }
+  .tag { font-size:12px; padding:2px 8px; border-radius:10px; border:1px solid; text-align:center; }
+  .tag.hit { color:var(--alert); border-color:var(--alert); }
+  .tag.fp { color:var(--warn); border-color:var(--warn); }
+  .empty { color:var(--muted); padding:20px 0; text-align:center; }
+  @media (max-width:640px) { .row { grid-template-columns:96px 1fr 70px; } .row .tag { display:none; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>PulseNet / live flow monitor</h1>
+  <div id="status"><span id="dot"></span><span id="statusText">connecting...</span></div>
+</header>
+<main>
+  <section class="stats">
+    <div class="card"><div class="k">flows scored</div><div class="v" id="nFlows">0</div></div>
+    <div class="card"><div class="k">alerts raised</div><div class="v alert" id="nAlerts">0</div></div>
+    <div class="card"><div class="k">alert rate</div><div class="v" id="rate">0%</div></div>
+    <div class="card"><div class="k">avg latency</div><div class="v" id="lat">-</div></div>
+    <div class="card"><div class="k">threshold</div><div class="v" id="thr">-</div></div>
+  </section>
+  <section class="card">
+    <h2>reconstruction error per flow, square-root scale (dashed line = alert threshold)</h2>
+    <canvas id="chart"></canvas>
+  </section>
+  <section class="card">
+    <h2>alerts (actual label shown, so false alarms are visible too)</h2>
+    <div id="feed"><div class="empty" id="empty">No alerts yet. Start the replay script.</div></div>
+  </section>
+</main>
+<script>
+const MAX_POINTS = 120;
+let points = [], flows = 0, alerts = 0, latSum = 0, threshold = null;
+const $ = id => document.getElementById(id);
+const canvas = $("chart"), ctx = canvas.getContext("2d");
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+function draw() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr; ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+  if (!points.length) return;
+  const ymax = Math.max(threshold * 2, ...points.map(p => p.score)) * 1.05;
+  const x = i => 8 + (w - 16) * i / (MAX_POINTS - 1);
+  const y = v => h - 8 - (h - 16) * Math.sqrt(Math.min(v / ymax, 1));   // sqrt scale keeps small scores visible
+  ctx.strokeStyle = css("--line"); ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, h - 8); ctx.lineTo(w, h - 8); ctx.stroke();
+  ctx.setLineDash([5, 4]); ctx.strokeStyle = css("--warn");
+  ctx.beginPath(); ctx.moveTo(0, y(threshold)); ctx.lineTo(w, y(threshold)); ctx.stroke(); ctx.setLineDash([]);
+  ctx.strokeStyle = css("--accent"); ctx.lineWidth = 1.5; ctx.beginPath();
+  points.forEach((p, i) => { i ? ctx.lineTo(x(i), y(p.score)) : ctx.moveTo(x(i), y(p.score)); });
+  ctx.stroke();
+  points.forEach((p, i) => { if (p.is_anomaly) { ctx.fillStyle = css("--alert"); ctx.beginPath(); ctx.arc(x(i), y(p.score), 3, 0, 7); ctx.fill(); } });
+}
+
+function addAlert(e) {
+  const empty = $("empty"); if (empty) empty.remove();
+  const real = e.true_label && e.true_label !== "normal";
+  const row = document.createElement("div"); row.className = "row";
+  const time = new Date(e.ts * 1000).toLocaleTimeString();
+  const label = e.true_label ? `actual: ${e.true_label}` : "";
+  row.innerHTML = `<span class="t">${time}</span><span>${e.protocol || ""} / ${e.service || ""}  <span class="t">${label}</span></span>` +
+                  `<span>${e.score.toFixed(4)}</span>` +
+                  `<span class="tag ${real ? "hit" : "fp"}">${real ? "true detection" : "false alarm"}</span>`;
+  $("feed").prepend(row);
+  while ($("feed").children.length > 60) $("feed").lastChild.remove();
+}
+
+function onEvent(e) {
+  threshold = e.threshold; flows++; latSum += e.latency_ms;
+  if (e.is_anomaly) { alerts++; addAlert(e); }
+  points.push(e); if (points.length > MAX_POINTS) points.shift();
+  $("nFlows").textContent = flows; $("nAlerts").textContent = alerts;
+  $("rate").textContent = (100 * alerts / flows).toFixed(1) + "%";
+  $("lat").textContent = (latSum / flows).toFixed(1) + " ms";
+  $("thr").textContent = threshold.toFixed(4);
+  draw();
+}
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws/alerts`);
+  ws.onopen = () => { $("dot").classList.add("on"); $("statusText").textContent = "connected"; };
+  ws.onmessage = m => onEvent(JSON.parse(m.data));
+  ws.onclose = () => { $("dot").classList.remove("on"); $("statusText").textContent = "disconnected, retrying..."; setTimeout(connect, 2000); };
+}
+fetch("/health").then(r => r.json()).then(h => { threshold = h.threshold; $("thr").textContent = threshold.toFixed(4); }).catch(() => {});
+window.addEventListener("resize", draw);
+connect();
+</script>
+</body>
+</html>
